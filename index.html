@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PWA Scheduler</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  body{font-family:system-ui,Arial;padding:14px;max-width:900px;margin:auto}
+  .card{border:1px solid #ddd;padding:12px;border-radius:8px;margin-bottom:12px}
+  label{display:block;margin:8px 0 4px}
+  input,button,select{padding:8px}
+  .small{font-size:0.9rem;color:#555}
+</style>
+</head>
+<body>
+  <h1>PWA Notification Scheduler</h1>
+
+  <div class="card">
+    <label>Message</label>
+    <input id="msg" placeholder="Reminder text" style="width:70%">
+
+    <label>Mode</label>
+    <label><input type="radio" name="mode" value="date" checked> Date (one-time)</label>
+    <label><input type="radio" name="mode" value="weekday"> Weekday (repeat weekly)</label>
+
+    <div id="dateSection">
+      <label>Date</label>
+      <input type="date" id="date">
+    </div>
+
+    <div id="weekdaySection" style="display:none">
+      <label>Weekdays</label>
+      <label><input class="day" type="checkbox" value="0"> Sun</label>
+      <label><input class="day" type="checkbox" value="1"> Mon</label>
+      <label><input class="day" type="checkbox" value="2"> Tue</label>
+      <label><input class="day" type="checkbox" value="3"> Wed</label>
+      <label><input class="day" type="checkbox" value="4"> Thu</label>
+      <label><input class="day" type="checkbox" value="5"> Fri</label>
+      <label><input class="day" type="checkbox" value="6"> Sat</label>
+    </div>
+
+    <label>Time</label>
+    <input type="time" id="time">
+
+    <div style="margin-top:10px">
+      <button id="perm">Enable Notifications</button>
+      <button id="add">Add Schedule</button>
+    </div>
+
+    <div id="hint" class="small" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h3>Schedules</h3>
+    <div id="list" class="small"></div>
+  </div>
+
+<script>
+(async function(){
+  // Register SW
+  if('serviceWorker' in navigator){
+    try{
+      const reg = await navigator.serviceWorker.register('sw.js');
+      console.log('SW registered', reg);
+    }catch(e){
+      console.error('SW register failed', e);
+    }
+  } else {
+    alert('Service Worker not supported in this browser.');
+  }
+
+  // UI switching
+  document.querySelectorAll('input[name="mode"]').forEach(r=>{
+    r.onchange = function(){
+      if(this.value === 'date'){ document.getElementById('dateSection').style.display='block'; document.getElementById('weekdaySection').style.display='none'; }
+      else { document.getElementById('dateSection').style.display='none'; document.getElementById('weekdaySection').style.display='block'; }
+    }
+  });
+
+  // Helpers
+  const hint = document.getElementById('hint');
+  function showHint(t){ hint.textContent = t; }
+
+  // Permission button
+  document.getElementById('perm').onclick = async ()=> {
+    if(!('Notification' in window)) return alert('Notifications not supported');
+    const p = await Notification.requestPermission();
+    showHint('Permission: ' + p);
+    if(p === 'granted') {
+      // tell SW to show we're ready
+      const reg = await navigator.serviceWorker.ready;
+      reg.active && reg.active.postMessage({type:'ready'});
+    }
+  };
+
+  // Storage
+  const key = 'pwa_schedules_v1';
+  let schedules = JSON.parse(localStorage.getItem(key) || '[]');
+  function save(){ localStorage.setItem(key, JSON.stringify(schedules)); render(); }
+
+  function render(){
+    const out = document.getElementById('list');
+    if(schedules.length===0){ out.innerHTML = '<div class="small">No schedules.</div>'; return; }
+    out.innerHTML = schedules.map(s=>{
+      if(s.type==='date') return `<div><b>${s.text}</b> — ${s.date} ${s.time} <button data-id="${s.id}" class="del">Delete</button></div>`;
+      return `<div><b>${s.text}</b> — ${s.time} | ${s.days.join(',')} <button data-id="${s.id}" class="del">Delete</button></div>`;
+    }).join('');
+    Array.from(document.querySelectorAll('.del')).forEach(b=>{
+      b.onclick = ()=>{
+        schedules = schedules.filter(s=>s.id!==b.dataset.id);
+        save();
+        // tell service worker to cancel if scheduled
+        navigator.serviceWorker.controller && navigator.serviceWorker.controller.postMessage({type:'cancel', id:b.dataset.id});
+      }
+    });
+  }
+
+  function uid(){ return 'id-'+Math.random().toString(36).slice(2,9); }
+
+  // Add schedule
+  document.getElementById('add').onclick = async ()=>{
+    const text = document.getElementById('msg').value.trim();
+    const time = document.getElementById('time').value;
+    if(!time) return alert('Select time');
+    const mode = document.querySelector('input[name="mode"]:checked').value;
+
+    if(mode==='date'){
+      const date = document.getElementById('date').value;
+      if(!date) return alert('Select date');
+      const id = uid();
+      const sch = { id, type:'date', text, date, time };
+      schedules.push(sch);
+      save();
+      // try to schedule via service worker (use showTrigger if available)
+      navigator.serviceWorker.controller && navigator.serviceWorker.controller.postMessage({type:'schedule-date', schedule:sch});
+      showHint('Scheduled (attempted). If your browser supports scheduled notifications it will fire even when closed. Otherwise app must be running or use server push.');
+      return;
+    }
+
+    // weekday mode
+    const days = Array.from(document.querySelectorAll('.day:checked')).map(x=>parseInt(x.value));
+    if(days.length===0) return alert('Choose weekday(s)');
+    const id = uid();
+    const sch = { id, type:'weekday', text, days, time };
+    schedules.push(sch);
+    save();
+    navigator.serviceWorker.controller && navigator.serviceWorker.controller.postMessage({type:'schedule-weekday', schedule:sch});
+    showHint('Weekly schedule added (attempted). For true background reliability, PWA installation + supported browser features required.');
+  };
+
+  // On load send all schedules to SW so SW may try restore scheduled triggers
+  navigator.serviceWorker.ready.then(reg=>{
+    reg.active && reg.active.postMessage({type:'restore', schedules});
+  });
+
+  render();
+
+  // Feature detection feedback
+  const reg = await navigator.serviceWorker.ready;
+  const supportsTrigger = 'showTrigger' in Notification.prototype || !!(reg && reg.getNotifications && (function(){ try{ return typeof window.TimestampTrigger !== 'undefined' }catch(e){return false} })());
+  if(supportsTrigger) showHint('Browser supports scheduled notifications API (best-case). Install PWA for background reliability.');
+  else showHint('Browser does NOT support scheduled notification API — fallback may require server push or keeping app open.');
+
+})();
+</script>
+</body>
+</html>
